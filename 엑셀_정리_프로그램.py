@@ -16,7 +16,7 @@ import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-from core import get_sheet_names, read_raw_sheet, compute_result_rows, run_conversion
+from core import get_sheet_names, get_sheet_headers, read_raw_sheet, compute_result_rows, run_conversion
 
 
 # ------------------------------------------------------------------
@@ -35,6 +35,11 @@ class App:
         self._raw_row_data = {}
         self._preview_row_data = {}
 
+        # "가져올 열" 빌더 UI 상태: 추가한 열들을 순서대로 담아두고,
+        # 여기서 core.py에 넘길 column_spec 문자열을 자동으로 만들어낸다.
+        self.column_entries = []
+        self.column_spec = tk.StringVar(value="")
+
         # ---- 파일 선택 ----
         frame_file = tk.Frame(root)
         frame_file.pack(fill="x", padx=10, pady=(10, 5))
@@ -52,31 +57,67 @@ class App:
         frame_opt = tk.LabelFrame(root, text="원본 시트 설정")
         frame_opt.pack(fill="x", padx=10, pady=5)
 
-        tk.Label(frame_opt, text="가져올 시트 이름:").grid(row=0, column=0, sticky="w", padx=5, pady=3)
-        self.rma_sheet_name = tk.StringVar(value="RMA")
-        self.combo_rma_sheet = ttk.Combobox(frame_opt, textvariable=self.rma_sheet_name, width=15)
-        self.combo_rma_sheet.grid(row=0, column=1, padx=5)
-        self.combo_rma_sheet.bind("<<ComboboxSelected>>", self.on_rma_sheet_selected)
+        tk.Label(frame_opt, text="가져올 열 (비워두면 기본 15개 열 사용):").grid(row=0, column=0, sticky="w", padx=5, pady=(5, 3))
 
-        tk.Label(frame_opt, text="헤더(열 제목) 행 번호:").grid(row=0, column=2, sticky="w", padx=(20, 0))
+        self._sheet_header_rows = {}  # {시트이름: 마지막으로 사용한 헤더 행 번호} 자동 기억용
+
+        frame_col_add = tk.Frame(frame_opt)
+        frame_col_add.grid(row=1, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+
+        # 1번째 줄: 시트 / 헤더 행 / 열 / 새로고침
+        tk.Label(frame_col_add, text="시트:").grid(row=0, column=0, sticky="w")
+        self.col_sheet_source = tk.StringVar(value="RMA")
+        self.combo_col_sheet = ttk.Combobox(frame_col_add, textvariable=self.col_sheet_source, width=14, state="readonly")
+        self.combo_col_sheet.grid(row=0, column=1, sticky="w", padx=(2, 10))
+        self.combo_col_sheet.bind("<<ComboboxSelected>>", self.on_col_sheet_changed)
+
+        tk.Label(frame_col_add, text="헤더 행:").grid(row=0, column=2, sticky="w")
         self.rma_header_row = tk.StringVar(value="2")
-        tk.Entry(frame_opt, textvariable=self.rma_header_row, width=5).grid(row=0, column=3, padx=5)
+        tk.Entry(frame_col_add, textvariable=self.rma_header_row, width=4).grid(row=0, column=3, sticky="w", padx=(2, 10))
 
-        tk.Label(
-            frame_opt,
-            text="열 제목이 있는 줄 번호예요. (예: 2행에 제목이 있으면 2 → 데이터는 3행부터 자동으로 읽음)",
-            fg="gray30", justify="left"
-        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 5))
+        tk.Label(frame_col_add, text="열:").grid(row=0, column=4, sticky="w")
+        self.col_ref_selected = tk.StringVar(value="")
+        self.combo_col_ref = ttk.Combobox(frame_col_add, textvariable=self.col_ref_selected, width=16, state="readonly")
+        self.combo_col_ref.grid(row=0, column=5, sticky="w", padx=(2, 4))
 
-        tk.Label(frame_opt, text="가져올 열 (비우면 기본 15개 열 사용):").grid(row=2, column=0, sticky="w", padx=5, pady=3)
-        self.column_spec = tk.StringVar(value="")
-        tk.Entry(frame_opt, textvariable=self.column_spec, width=50).grid(row=2, column=1, columnspan=3, sticky="w", padx=5)
+        tk.Button(frame_col_add, text="새로고침", command=self.refresh_col_ref_options).grid(row=0, column=6, sticky="w")
 
-        tk.Label(
-            frame_opt,
-            text="입력 예시: 열이름1,열이름2  또는  1,3,5  또는  A,C,E",
-            fg="gray30", justify="left"
-        ).grid(row=3, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 5))
+        # 2번째 줄: 출력 이름 / 추가 / 공백 열 추가
+        tk.Label(frame_col_add, text="출력 이름(선택):").grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.col_output_name = tk.StringVar(value="")
+        tk.Entry(frame_col_add, textvariable=self.col_output_name, width=20).grid(
+            row=1, column=2, columnspan=2, sticky="w", padx=(2, 10), pady=(6, 0)
+        )
+
+        tk.Button(frame_col_add, text="추가", command=self.add_column_entry).grid(
+            row=1, column=4, sticky="w", padx=(0, 5), pady=(6, 0)
+        )
+        tk.Button(frame_col_add, text="공백 열 추가", command=self.add_blank_entry).grid(
+            row=1, column=5, columnspan=2, sticky="w", pady=(6, 0)
+        )
+
+        frame_col_list = tk.Frame(frame_opt)
+        frame_col_list.grid(row=2, column=0, columnspan=4, sticky="w", padx=5, pady=(8, 3))
+
+        self.column_listbox = tk.Listbox(frame_col_list, width=62, height=5, exportselection=False)
+        self.column_listbox.pack(side="left")
+
+        frame_col_list_buttons = tk.Frame(frame_col_list)
+        frame_col_list_buttons.pack(side="left", padx=(8, 0), fill="y")
+        tk.Button(frame_col_list_buttons, text="▲ 위로", width=10,
+                  command=lambda: self.move_selected_column_entry(-1)).pack(fill="x")
+        tk.Button(frame_col_list_buttons, text="▼ 아래로", width=10,
+                  command=lambda: self.move_selected_column_entry(1)).pack(fill="x", pady=(2, 0))
+        tk.Button(frame_col_list_buttons, text="선택 삭제", width=10,
+                  command=self.remove_selected_column_entry).pack(fill="x", pady=(8, 0))
+        tk.Button(frame_col_list_buttons, text="전체 지우기", width=10,
+                  command=self.clear_column_entries).pack(fill="x", pady=(2, 0))
+
+        self.spec_preview_label = tk.Label(
+            frame_opt, text="만들어지는 입력값: (없음 → 기본 15개 열 사용)",
+            fg="gray30", justify="left", anchor="w", wraplength=700
+        )
+        self.spec_preview_label.grid(row=3, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 5))
 
         # ---- 대상 시트 옵션 ----
         frame_target = tk.LabelFrame(root, text="결과를 저장할 위치")
@@ -93,6 +134,20 @@ class App:
         self.existing_sheet_name = tk.StringVar()
         self.combo_existing = ttk.Combobox(frame_target, textvariable=self.existing_sheet_name, width=23, state="disabled")
         self.combo_existing.grid(row=1, column=1, sticky="w", padx=5)
+        self.combo_existing.bind("<<ComboboxSelected>>", self.on_existing_sheet_selected)
+
+        tk.Label(frame_target, text="새 열 삽입 위치 (선택, 비우면 맨 뒤에 추가):").grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        self.insert_ref_column = tk.StringVar(value="")
+        self.combo_insert_ref = ttk.Combobox(frame_target, textvariable=self.insert_ref_column, width=20, state="disabled")
+        self.combo_insert_ref.grid(row=2, column=1, sticky="w", padx=5)
+
+        self.insert_position = tk.StringVar(value="after")
+        frame_insert_pos = tk.Frame(frame_target)
+        frame_insert_pos.grid(row=2, column=2, columnspan=2, sticky="w")
+        self.radio_insert_before = tk.Radiobutton(frame_insert_pos, text="선택한 열 앞에", variable=self.insert_position, value="before")
+        self.radio_insert_before.pack(side="left")
+        self.radio_insert_after = tk.Radiobutton(frame_insert_pos, text="선택한 열 뒤에", variable=self.insert_position, value="after")
+        self.radio_insert_after.pack(side="left")
 
         # ---- 복사 옵션 ----
         frame_copy_opt = tk.LabelFrame(root, text="복사 옵션")
@@ -207,9 +262,148 @@ class App:
         if self.target_mode.get() == "new":
             self.entry_new_name.config(state="normal")
             self.combo_existing.config(state="disabled")
+            self.combo_insert_ref.config(state="disabled")
         else:
             self.entry_new_name.config(state="disabled")
             self.combo_existing.config(state="readonly")
+            self.combo_insert_ref.config(state="readonly")
+
+    # ---- "가져올 열" 빌더 ----
+
+    def refresh_col_ref_options(self):
+        """'시트' 콤보박스에서 고른 시트의 실제 헤더 이름들로 '열' 콤보박스를 채운다."""
+        path = self.filepath.get().strip()
+        sheet = self.col_sheet_source.get().strip()
+        try:
+            header_row = int(self.rma_header_row.get().strip())
+        except ValueError:
+            header_row = 1
+
+        headers = []
+        if path and sheet and os.path.exists(path):
+            try:
+                headers = get_sheet_headers(path, sheet, header_row)
+            except Exception:
+                headers = []
+
+        self.combo_col_ref["values"] = headers
+        self.col_ref_selected.set(headers[0] if headers else "")
+
+    def on_col_sheet_changed(self, event=None):
+        """'시트' 콤보박스를 바꾸면, 그 시트에서 마지막으로 썼던 헤더 행 번호를 자동으로 불러온다."""
+        sheet = self.col_sheet_source.get().strip()
+        if sheet in self._sheet_header_rows:
+            self.rma_header_row.set(str(self._sheet_header_rows[sheet]))
+        self.refresh_col_ref_options()
+
+    def _get_primary_sheet_name(self):
+        """실제 처리(행 순회)의 기준이 되는 시트 이름.
+        이미 추가한 열이 있으면 그중 첫 번째 '실제' 열(빈 열 제외)의 시트를 기준으로 삼고,
+        아직 추가한 열이 없으면 지금 '시트' 콤보박스에서 선택 중인 값을 기준으로 삼는다."""
+        first_real = next((e for e in self.column_entries if not e["is_blank"]), None)
+        if first_real:
+            return first_real["sheet_name"]
+        return self.col_sheet_source.get().strip()
+
+    def _get_primary_header_row(self):
+        """기준 시트의 헤더 행 번호. 규칙은 _get_primary_sheet_name과 동일하게 첫 번째 실제 열 기준."""
+        first_real = next((e for e in self.column_entries if not e["is_blank"]), None)
+        if first_real:
+            return first_real["header_row"]
+        return int(self.rma_header_row.get().strip())
+
+    def _get_sheet_header_rows(self):
+        """{시트이름: 헤더 행 번호} - 지금까지 추가한 열들이 사용한 시트별 헤더 행을 core.py에 그대로 전달."""
+        return {
+            e["sheet_name"]: e["header_row"]
+            for e in self.column_entries
+            if not e["is_blank"]
+        }
+
+    def add_column_entry(self):
+        sheet = self.col_sheet_source.get().strip()
+        ref = self.col_ref_selected.get().strip()
+        if not sheet or not ref:
+            messagebox.showwarning("알림", "먼저 시트와 열을 선택해주세요.")
+            return
+        try:
+            header_row = int(self.rma_header_row.get().strip())
+        except ValueError:
+            messagebox.showerror("오류", "헤더 행 번호는 숫자로 입력해주세요.")
+            return
+        output_name = self.col_output_name.get().strip() or ref
+        self.column_entries.append(
+            {"output_name": output_name, "sheet_name": sheet, "ref": ref, "is_blank": False, "header_row": header_row}
+        )
+        self._sheet_header_rows[sheet] = header_row
+        self.col_output_name.set("")
+        self._refresh_column_listbox()
+
+    def add_blank_entry(self):
+        output_name = self.col_output_name.get().strip()
+        self.column_entries.append(
+            {"output_name": output_name, "sheet_name": None, "ref": None, "is_blank": True, "header_row": None}
+        )
+        self.col_output_name.set("")
+        self._refresh_column_listbox()
+
+    def remove_selected_column_entry(self):
+        sel = self.column_listbox.curselection()
+        if not sel:
+            return
+        del self.column_entries[sel[0]]
+        self._refresh_column_listbox()
+
+    def move_selected_column_entry(self, direction):
+        sel = self.column_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        new_idx = idx + direction
+        if 0 <= new_idx < len(self.column_entries):
+            self.column_entries[idx], self.column_entries[new_idx] = (
+                self.column_entries[new_idx],
+                self.column_entries[idx],
+            )
+            self._refresh_column_listbox()
+            self.column_listbox.selection_set(new_idx)
+
+    def clear_column_entries(self):
+        self.column_entries = []
+        self._refresh_column_listbox()
+
+    def _entry_label(self, entry):
+        if entry["is_blank"]:
+            return f"(빈 열: {entry['output_name']})" if entry["output_name"] else "(빈 열)"
+        primary = self._get_primary_sheet_name()
+        src = entry["ref"] if entry["sheet_name"] == primary else f"{entry['sheet_name']}!{entry['ref']}"
+        return f"{entry['output_name']}  ←  {src}"
+
+    def _refresh_column_listbox(self):
+        self.column_listbox.delete(0, "end")
+        for entry in self.column_entries:
+            self.column_listbox.insert("end", self._entry_label(entry))
+        self._refresh_spec_preview()
+
+    def _build_column_spec_text(self):
+        primary = self._get_primary_sheet_name()
+        tokens = []
+        for entry in self.column_entries:
+            if entry["is_blank"]:
+                tokens.append(f"{entry['output_name']}=" if entry["output_name"] else "")
+                continue
+            sheet_prefix = f"{entry['sheet_name']}!" if entry["sheet_name"] and entry["sheet_name"] != primary else ""
+            tokens.append(f"{entry['output_name']}={sheet_prefix}{entry['ref']}")
+        return ",".join(tokens)
+
+    def _refresh_spec_preview(self):
+        spec_text = self._build_column_spec_text()
+        self.column_spec.set(spec_text)
+        primary = self._get_primary_sheet_name()
+        primary_desc = f"기준 시트: {primary}" if primary else "기준 시트: (선택 안 됨)"
+        self.spec_preview_label.config(
+            text=f"{primary_desc}   |   만들어지는 입력값: " + (spec_text or "(없음 → 기본 15개 열 사용)")
+        )
 
     def browse_file(self):
         path = filedialog.askopenfilename(
@@ -226,15 +420,21 @@ class App:
                 self.combo_existing["values"] = names
                 if names:
                     self.existing_sheet_name.set(names[0])
-                self.combo_rma_sheet["values"] = names
-                if names:
-                    # 이름에 'RMA'가 들어간 시트가 있으면 그걸 기본 선택, 없으면 첫번째 시트
-                    guess = next((n for n in names if "RMA" in n.upper()), names[0])
-                    self.rma_sheet_name.set(guess)
+                    self.refresh_insert_ref_options(path, names[0])
+                # 이름에 'RMA'가 들어간 시트가 있으면 그걸 기본 선택, 없으면 첫번째 시트
+                guess = next((n for n in names if "RMA" in n.upper()), names[0]) if names else ""
                 self.combo_raw_sheet["values"] = names
                 if names:
                     self.raw_view_sheet.set(guess)
                     self.load_raw_sheet(path, guess)
+
+                self.combo_col_sheet["values"] = names
+                self.column_entries = []
+                self._sheet_header_rows = {}
+                if names:
+                    self.col_sheet_source.set(guess)
+                    self.refresh_col_ref_options()
+                self._refresh_column_listbox()
             except Exception as e:
                 messagebox.showwarning("알림", f"시트 목록을 읽는 중 문제가 발생했습니다: {e}")
 
@@ -312,24 +512,30 @@ class App:
         self.raw_detail.config(text=text or "(빈 행)")
 
     def on_raw_sheet_selected(self, event=None):
-        """'볼 시트' 드롭다운에서 시트를 고르면 바로 내용을 보여주고, RMA 시트 이름도 같이 맞춘다."""
+        """'볼 시트' 드롭다운에서 시트를 고르면 바로 내용을 보여준다."""
         sheet = self.raw_view_sheet.get().strip()
         if not sheet:
             return
-        self.rma_sheet_name.set(sheet)  # RMA 시트 이름 콤보박스와 동기화
         path = self.filepath.get().strip()
         if path and os.path.exists(path):
             self.load_raw_sheet(path, sheet)
 
-    def on_rma_sheet_selected(self, event=None):
-        """'RMA 시트 이름' 드롭다운에서 시트를 고르면, '볼 시트'도 같이 맞추고 내용을 보여준다."""
-        sheet = self.rma_sheet_name.get().strip()
-        if not sheet:
-            return
-        self.raw_view_sheet.set(sheet)  # 볼 시트 콤보박스와 동기화
+    def on_existing_sheet_selected(self, event=None):
+        """'기존 시트에 이어서 추가' 대상 시트를 고르면, 삽입 위치 콤보박스도 그 시트의 헤더로 갱신."""
         path = self.filepath.get().strip()
-        if path and os.path.exists(path):
-            self.load_raw_sheet(path, sheet)
+        sheet = self.existing_sheet_name.get().strip()
+        if path and sheet and os.path.exists(path):
+            self.refresh_insert_ref_options(path, sheet)
+
+    def refresh_insert_ref_options(self, path, sheet_name):
+        """삽입 위치 콤보박스의 목록을 지정한 시트의 현재 헤더 이름들로 채운다."""
+        try:
+            headers = get_sheet_headers(path, sheet_name)
+        except Exception:
+            headers = []
+        self.combo_insert_ref["values"] = headers
+        if self.insert_ref_column.get() not in headers:
+            self.insert_ref_column.set("")
 
     def refresh_sheet_lists(self, path, prefer_sheet=None):
         """파일에 시트가 추가/변경된 뒤 각종 드롭다운과 안내 문구를 다시 채운다."""
@@ -341,13 +547,20 @@ class App:
 
         self.sheet_list_label.config(text=f"이 파일의 시트 목록 ({len(names)}개): " + ", ".join(names))
         self.combo_existing["values"] = names
-        self.combo_rma_sheet["values"] = names
         self.combo_raw_sheet["values"] = names
+        self.combo_col_sheet["values"] = names
 
         if prefer_sheet and prefer_sheet in names:
             self.existing_sheet_name.set(prefer_sheet)
         elif names and self.existing_sheet_name.get() not in names:
             self.existing_sheet_name.set(names[0])
+
+        if self.existing_sheet_name.get() in names:
+            self.refresh_insert_ref_options(path, self.existing_sheet_name.get())
+
+        if self.col_sheet_source.get() in names:
+            self.refresh_col_ref_options()
+        self._refresh_column_listbox()
 
         # 지금 '원본 시트 보기' 탭에서 보고 있던 시트가 여전히 있으면 그대로 새로고침
         if self.raw_view_sheet.get() in names:
@@ -362,7 +575,7 @@ class App:
             messagebox.showerror("오류", "파일을 찾을 수 없습니다.")
             return None
         try:
-            header_row = int(self.rma_header_row.get().strip())
+            header_row = self._get_primary_header_row()
         except ValueError:
             messagebox.showerror("오류", "헤더 행 번호는 숫자로 입력해주세요.")
             return None
@@ -382,13 +595,16 @@ class App:
         try:
             headers, rows, missing_cols, filled_names = compute_result_rows(
                 filepath=path,
-                rma_sheet_name=self.rma_sheet_name.get().strip(),
+                rma_sheet_name=self._get_primary_sheet_name(),
                 rma_header_row=header_row,
                 column_spec_text=self.column_spec.get().strip(),
                 target_mode=mode,
                 existing_sheet_name=self.existing_sheet_name.get().strip(),
                 log=self.log,
+                insert_ref_column=self.insert_ref_column.get().strip(),
+                insert_position=self.insert_position.get(),
                 max_preview_rows=200,
+                sheet_header_rows=self._get_sheet_header_rows(),
             )
             self.fill_tree(headers, rows, filled_names)
             info = (
@@ -415,7 +631,7 @@ class App:
         try:
             sheet = run_conversion(
                 filepath=path,
-                rma_sheet_name=self.rma_sheet_name.get().strip(),
+                rma_sheet_name=self._get_primary_sheet_name(),
                 rma_header_row=header_row,
                 column_spec_text=self.column_spec.get().strip(),
                 target_mode=mode,
@@ -424,6 +640,9 @@ class App:
                 copy_style=self.copy_style.get(),
                 copy_formula=self.copy_formula.get(),
                 log=self.log,
+                insert_ref_column=self.insert_ref_column.get().strip(),
+                insert_position=self.insert_position.get(),
+                sheet_header_rows=self._get_sheet_header_rows(),
             )
             # 새로 생기거나 갱신된 시트가 바로 드롭다운/목록/원본 보기에 반영되도록 새로고침
             self.refresh_sheet_lists(path, prefer_sheet=sheet)

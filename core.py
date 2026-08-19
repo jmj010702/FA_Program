@@ -10,6 +10,7 @@ GUI는 엑셀_정리_프로그램.py 에 있고, 이 파일의 함수들을 가�
 
 import copy
 import datetime
+from collections import namedtuple
 
 import openpyxl
 from openpyxl.utils import get_column_letter, column_index_from_string
@@ -36,7 +37,7 @@ def normalize(name):
 
 
 def build_header_map(ws, header_row):
-    """{열이름: 열번호} 딕셔너리 생성 (RMA 시트용)"""
+    """{열이름: 열번호} 딕셔너리 생성. 원본/대상 어떤 시트에나 사용할 수 있다."""
     header_map = {}
     for col_idx in range(1, ws.max_column + 1):
         name = normalize(ws.cell(row=header_row, column=col_idx).value)
@@ -45,60 +46,239 @@ def build_header_map(ws, header_row):
     return header_map
 
 
-def resolve_columns(spec_text, header_map):
-    """
-    '가져올 열' 입력창의 텍스트를 파싱해서
-    [(output_name, rma_col_idx), ...] 리스트로 변환한다.
+# ------------------------------------------------------------------
+# 열 지정(column_spec) 파싱 & 해석
+#
+# 한 토큰(콤마로 구분)의 형태:  [출력이름=] [시트이름!] 원본식별자
+#   "SITE"            -> 기준 시트에서 이름/번호/문자로 찾고, 출력 이름도 그대로 (하위호환)
+#   "SITE=지역"        -> 기준 시트의 "지역" 열을 가져와 출력 이름은 "SITE"
+#   "SITE=RMA!지역"    -> "RMA" 시트의 "지역" 열을 가져와 출력 이름은 "SITE"
+#   "" (빈 토큰)        -> 이름도 데이터도 없는 스페이서 열
+#   "비고="            -> 이름은 있지만 데이터는 없는 열 (수기 입력용)
+# ------------------------------------------------------------------
 
-    입력 예시:
-      "관리국,SITE,유니트명"   -> 이름으로 지정
-      "1,3,5"                  -> 번호로 지정
-      "A,C,E"                  -> 열 문자로 지정
-      (비워두면) 기본 DEFAULT_COLUMNS 사용
+RawToken = namedtuple("RawToken", ["output_name", "sheet_name", "ref"])
+ColumnPlan = namedtuple("ColumnPlan", ["output_name", "sheet_name", "col_idx"])
+
+
+def parse_column_spec(spec_text):
+    """'가져올 열' 입력창의 텍스트를 문자열 수준에서만 파싱한다 (시트/헤더 조회 없음)."""
+    tokens = []
+    for raw in spec_text.split(","):
+        t = raw.strip()
+        if t == "":
+            tokens.append(RawToken("", None, None))
+            continue
+
+        if "=" in t:
+            left, right = t.split("=", 1)
+            output_name = left.strip()
+            right = right.strip()
+        else:
+            output_name = None
+            right = t
+
+        if right == "":
+            tokens.append(RawToken(output_name or "", None, None))
+            continue
+
+        if "!" in right:
+            sheet_part, ref_part = right.split("!", 1)
+            sheet_name = sheet_part.strip() or None
+            ref = ref_part.strip()
+        else:
+            sheet_name = None
+            ref = right
+
+        tokens.append(RawToken(output_name, sheet_name, ref))
+    return tokens
+
+
+def _resolve_single_ref(ref, header_map):
+    """ref(이름/번호/열문자) 하나를 header_map에서 찾아 (열번호, 원본헤더이름)을 반환. 못 찾으면 (None, None)."""
+    if ref in header_map:
+        return header_map[ref], ref
+
+    reverse_map = {v: k for k, v in header_map.items()}
+
+    if ref.isdigit():
+        col_idx = int(ref)
+        return col_idx, reverse_map.get(col_idx, f"열{col_idx}")
+
+    if ref.isalpha():
+        try:
+            col_idx = column_index_from_string(ref.upper())
+            return col_idx, reverse_map.get(col_idx, f"열{col_idx}")
+        except Exception:
+            pass
+
+    return None, None
+
+
+def resolve_column_plan(wb, primary_sheet_name, header_row, spec_text, log, sheet_header_rows=None):
     """
-    result = []
+    parse_column_spec 결과를 실제 워크북에 대해 해석해서 ColumnPlan 목록으로 변환한다.
+    참조되는 시트마다 build_header_map을 지연 호출해서 캐싱한다.
+
+    sheet_header_rows: {시트이름: 그 시트의 헤더 행 번호} (선택). 시트마다 헤더 행이 다를 수 있어서,
+      여기 없는 시트는 기본값인 header_row(기준 시트의 헤더 행)를 그대로 쓴다.
+
+    반환값: (plan, missing)
+      plan: [ColumnPlan(output_name, sheet_name, col_idx), ...] (col_idx=None이면 스페이서 열)
+      missing: 못 찾은 항목 설명 문자열 목록
+    """
+    sheet_header_rows = sheet_header_rows or {}
+    header_maps = {}
+
+    def get_header_map(sheet_name):
+        if sheet_name not in header_maps:
+            if sheet_name in wb.sheetnames:
+                hr = sheet_header_rows.get(sheet_name, header_row)
+                header_maps[sheet_name] = build_header_map(wb[sheet_name], hr)
+            else:
+                header_maps[sheet_name] = None
+        return header_maps[sheet_name]
+
+    plan = []
     missing = []
 
     if not spec_text or not spec_text.strip():
-        # 기본 열 목록 사용 (이름 매칭)
+        # 기본 열 목록 사용 (기준 시트에서 이름 매칭)
+        primary_map = get_header_map(primary_sheet_name) or {}
         for name in DEFAULT_COLUMNS:
-            col_idx = header_map.get(normalize(name))
+            col_idx = primary_map.get(normalize(name))
             if col_idx:
-                result.append((name, col_idx))
+                plan.append(ColumnPlan(name, primary_sheet_name, col_idx))
             else:
                 missing.append(name)
-        return result, missing
+        return plan, missing
 
-    tokens = [t.strip() for t in spec_text.split(",") if t.strip()]
-    reverse_map = {v: k for k, v in header_map.items()}  # 열번호 -> 이름
-
-    for token in tokens:
-        # 1) 이름으로 먼저 시도
-        if token in header_map:
-            result.append((token, header_map[token]))
+    for tok in parse_column_spec(spec_text):
+        if tok.ref is None:
+            plan.append(ColumnPlan(tok.output_name, None, None))
             continue
 
-        # 2) 숫자(열 번호)로 시도
-        if token.isdigit():
-            col_idx = int(token)
-            out_name = reverse_map.get(col_idx, f"열{col_idx}")
-            result.append((out_name, col_idx))
+        sheet_name = tok.sheet_name or primary_sheet_name
+        hmap = get_header_map(sheet_name)
+        if hmap is None:
+            missing.append(f"{tok.ref} (시트 '{sheet_name}' 없음)")
             continue
 
-        # 3) 열 문자(A, B, C ...)로 시도
-        if token.isalpha():
-            try:
-                col_idx = column_index_from_string(token.upper())
-                out_name = reverse_map.get(col_idx, f"열{col_idx}")
-                result.append((out_name, col_idx))
+        col_idx, resolved_name = _resolve_single_ref(tok.ref, hmap)
+        if col_idx is None:
+            missing.append(f"{tok.ref} ({sheet_name} 시트에서 못 찾음)" if tok.sheet_name else tok.ref)
+            continue
+
+        output_name = tok.output_name if tok.output_name is not None else resolved_name
+        plan.append(ColumnPlan(output_name, sheet_name, col_idx))
+
+    return plan, missing
+
+
+# ------------------------------------------------------------------
+# 여러 시트 결합 (키 값 기준 매칭)
+# ------------------------------------------------------------------
+
+def build_key_index(ws, header_row, key_col_idx, log, sheet_label):
+    """시트를 훑어서 {정규화된 키 값: 행번호} 딕셔너리를 만든다. 중복 키는 첫 번째 행만 사용."""
+    index = {}
+    dup_count = 0
+    for r in range(header_row + 1, ws.max_row + 1):
+        v = normalize(ws.cell(row=r, column=key_col_idx).value)
+        if not v:
+            continue
+        if v in index:
+            dup_count += 1
+            continue
+        index[v] = r
+    if dup_count:
+        log(f"※ '{sheet_label}' 시트에 키 값이 중복된 행이 {dup_count}개 있어 첫 번째 행만 사용했습니다.")
+    return index
+
+
+def iter_matched_rows(wb, primary_sheet_name, header_row, plan, key_column_name, log, sheet_header_rows=None):
+    """
+    기준 시트를 행 단위로 순회하면서, plan의 각 항목에 대응하는 셀 위치를
+    (시트이름, 행번호, 열번호) 튜플로 만들어 매 행마다 plan과 같은 길이의 리스트로 yield한다.
+    (스페이서이거나 값을 못 찾으면 (None, None, None))
+
+    sheet_header_rows: {시트이름: 그 시트의 헤더 행 번호} (선택). 시트마다 헤더 행이 다를 수 있어서,
+      여기 없는 시트는 기본값인 header_row(기준 시트의 헤더 행)를 그대로 쓴다.
+
+    다른 시트를 참조하는 항목이 있을 때:
+      - key_column_name이 주어지면: 그 열 값이 같은 행끼리 짝을 맞춰서 가져온다 (순서가 달라도 안전)
+      - key_column_name이 비어있으면: 그냥 "몇 번째 데이터 행인지"로 위치를 맞춰서 그대로 가져온다
+        (기준 시트의 n번째 데이터 행 <-> 다른 시트의 n번째 데이터 행. 다른 시트도 같은 순서로
+        정리되어 있다는 걸 사용자가 확인했을 때만 안전함)
+    """
+    sheet_header_rows = sheet_header_rows or {}
+    ws_primary = wb[primary_sheet_name]
+    primary_header_map = build_header_map(ws_primary, header_row)
+
+    other_sheet_names = sorted({p.sheet_name for p in plan if p.sheet_name and p.sheet_name != primary_sheet_name})
+    use_key = bool(key_column_name)
+
+    key_col_primary_idx = None
+    key_indexes = {}
+    if use_key:
+        key_col_primary_idx = primary_header_map.get(normalize(key_column_name))
+        if key_col_primary_idx is None:
+            raise ValueError(f"기준 열 '{key_column_name}'을(를) 기준 시트에서 찾을 수 없습니다.")
+
+        for sheet_name in other_sheet_names:
+            other_header_row = sheet_header_rows.get(sheet_name, header_row)
+            other_header_map = build_header_map(wb[sheet_name], other_header_row)
+            key_idx = other_header_map.get(normalize(key_column_name))
+            if key_idx is None:
+                raise ValueError(f"기준 열 '{key_column_name}'을(를) '{sheet_name}' 시트에서 찾을 수 없습니다.")
+            key_indexes[sheet_name] = build_key_index(wb[sheet_name], other_header_row, key_idx, log, sheet_name)
+
+    anchor = next(
+        (p for p in plan if p.sheet_name == primary_sheet_name and p.col_idx is not None),
+        None,
+    )
+    anchor_idx = anchor.col_idx if anchor else key_col_primary_idx
+    if anchor_idx is None:
+        raise ValueError("최소 1개 열은 기준 시트에서 가져오거나, 행 맞춤 기준 열을 지정해야 합니다.")
+
+    unmatched_count = 0
+    data_offset = 0  # 몇 번째 데이터 행인지(0부터) - 순서 기준 매칭에 사용
+    for r in range(header_row + 1, ws_primary.max_row + 1):
+        if ws_primary.cell(row=r, column=anchor_idx).value in (None, ""):
+            continue
+
+        key_val = normalize(ws_primary.cell(row=r, column=key_col_primary_idx).value) if key_col_primary_idx else None
+
+        locations = []
+        row_unmatched = False
+        for p in plan:
+            if p.col_idx is None:
+                locations.append((None, None, None))
                 continue
-            except Exception:
-                pass
+            if p.sheet_name == primary_sheet_name:
+                locations.append((p.sheet_name, r, p.col_idx))
+                continue
+            if use_key:
+                target_row = key_indexes.get(p.sheet_name, {}).get(key_val) if key_val else None
+            else:
+                other_header_row = sheet_header_rows.get(p.sheet_name, header_row)
+                candidate_row = other_header_row + 1 + data_offset
+                target_row = candidate_row if candidate_row <= wb[p.sheet_name].max_row else None
+            if target_row is None:
+                locations.append((None, None, None))
+                row_unmatched = True
+            else:
+                locations.append((p.sheet_name, target_row, p.col_idx))
+        if row_unmatched:
+            unmatched_count += 1
+        data_offset += 1
+        yield locations
 
-        # 어느 것도 해당 안 되면 못 찾은 것으로 기록
-        missing.append(token)
-
-    return result, missing
+    if unmatched_count:
+        if use_key:
+            log(f"※ 다른 시트와 키 값이 맞지 않아 일부를 비워둔 행: {unmatched_count}개")
+        else:
+            log(f"※ 다른 시트에 대응하는 행이 부족해 일부를 비워둔 행: {unmatched_count}개")
 
 
 def copy_cell(src_cell, dst_cell, copy_style, copy_formula):
@@ -150,6 +330,22 @@ def get_sheet_names(filepath):
     return names
 
 
+def get_sheet_headers(filepath, sheet_name, header_row=1):
+    """지정한 시트의 header_row에 있는 헤더 이름 목록을 순서대로 반환한다 (빈 칸 제외)."""
+    wb = openpyxl.load_workbook(filepath, read_only=True)
+    if sheet_name not in wb.sheetnames:
+        wb.close()
+        raise ValueError(f"'{sheet_name}' 시트를 찾을 수 없습니다.")
+    ws = wb[sheet_name]
+    names = []
+    for col_idx in range(1, ws.max_column + 1):
+        name = normalize(ws.cell(row=header_row, column=col_idx).value)
+        if name:
+            names.append(name)
+    wb.close()
+    return names
+
+
 def make_unique_sheet_name(wb, base_name):
     if base_name not in wb.sheetnames:
         return base_name
@@ -167,7 +363,11 @@ def compute_result_rows(
     target_mode,
     existing_sheet_name,
     log,
+    key_column_name="",
+    insert_ref_column="",
+    insert_position="after",
     max_preview_rows=None,
+    sheet_header_rows=None,
 ):
     """
     저장은 하지 않고, '실행'했을 때 나올 결과(헤더, 데이터 행)를 계산만 해서 돌려준다.
@@ -175,79 +375,91 @@ def compute_result_rows(
 
     반환값: (headers, rows, missing_cols, filled_names)
       - target_mode가 "existing"이면 headers는 기존 시트의 헤더를 기준으로 만들어짐
-      - filled_names는 이번 실행에서 실제로 값이 채워지는 열 이름 목록 (미리보기에서
-        그 열로 자동 스크롤하는 데 사용)
+        (insert_ref_column/insert_position이 지정되면 그 위치에 새 열이 끼워진 모습으로 미리보기됨)
+      - filled_names는 이번 실행에서 실제로 값이 채워지는 열 이름 목록
     """
     # 읽기 전용으로 열어서 엑셀이 열려있어도 항상 미리보기가 가능하게 함
     wb = openpyxl.load_workbook(filepath, read_only=False)
 
     if rma_sheet_name not in wb.sheetnames:
+        wb.close()
         raise ValueError(
             f"'{rma_sheet_name}' 시트를 찾을 수 없습니다. 현재 시트 목록: {wb.sheetnames}"
         )
-    ws_rma = wb[rma_sheet_name]
 
-    header_map = build_header_map(ws_rma, rma_header_row)
-    log(f"RMA 시트({rma_header_row}행)에서 찾은 열 이름 {len(header_map)}개: {list(header_map.keys())}")
-
-    columns, missing_cols = resolve_columns(column_spec_text, header_map)
-    if not columns:
+    plan, missing_cols = resolve_column_plan(
+        wb, rma_sheet_name, rma_header_row, column_spec_text, log, sheet_header_rows=sheet_header_rows
+    )
+    if not plan:
+        wb.close()
         raise ValueError("가져올 열을 하나도 찾지 못했습니다. 입력값과 헤더 행 번호를 확인해주세요.")
     if missing_cols:
-        log("※ 다음 열은 RMA 시트에서 찾지 못해 제외됩니다: " + ", ".join(missing_cols))
+        log("※ 다음 열은 찾지 못해 제외됩니다: " + ", ".join(missing_cols))
 
-    # 대상(출력) 헤더 결정
     if target_mode == "existing" and existing_sheet_name in wb.sheetnames:
         ws_target = wb[existing_sheet_name]
-        existing_header = {}
-        for col_idx in range(1, ws_target.max_column + 1):
-            name = normalize(ws_target.cell(row=1, column=col_idx).value)
-            if name:
-                existing_header[name] = col_idx
-        if existing_header:
-            # 기존 시트 헤더 순서 그대로 표시하고, 그 중 이번에 채워질 열만 데이터가 들어감
-            headers = [None] * ws_target.max_column
-            for name, idx in existing_header.items():
-                headers[idx - 1] = name
-            headers = [h if h else "" for h in headers]
-        else:
-            headers = []
+        existing_header = build_header_map(ws_target, header_row=1)
 
-        # 이번에 채워지는 열 중, 기존 시트에 아직 없는 열은 실제 실행 시와 동일하게
-        # 맨 뒤에 새 열로 추가되므로 미리보기에도 똑같이 반영한다.
-        existing_names = set(h for h in headers if h)
-        for name, _ in columns:
-            if name not in existing_names:
-                headers.append(name)
-                existing_names.add(name)
-    else:
-        headers = [name for name, _ in columns]
+        skipped = [p for p in plan if p.col_idx is None]
+        if skipped:
+            log(f"※ 빈 스페이서 열은 '기존 시트에 이어서 추가' 모드에서 지원하지 않아 제외됩니다 ({len(skipped)}개).")
+        data_plan = [p for p in plan if p.col_idx is not None]
 
-    # 각 출력 헤더 이름 -> RMA 열 인덱스 매핑 (없으면 None)
-    name_to_rma_idx = {name: idx for name, idx in columns}
+        headers = [None] * ws_target.max_column
+        for name, idx in existing_header.items():
+            headers[idx - 1] = name
+        headers = [h if h else "" for h in headers]
 
-    data_start = rma_header_row + 1
-    data_end = ws_rma.max_row
-    first_col_idx = columns[0][1]
-
-    rows = []
-    for r in range(data_start, data_end + 1):
-        if ws_rma.cell(row=r, column=first_col_idx).value in (None, ""):
-            continue
-        row_values = []
-        for h in headers:
-            rma_idx = name_to_rma_idx.get(h)
-            if rma_idx:
-                v = ws_rma.cell(row=r, column=rma_idx).value
+        new_names = []
+        for p in data_plan:
+            if p.output_name not in existing_header and p.output_name not in new_names:
+                new_names.append(p.output_name)
+        if new_names:
+            if insert_ref_column and insert_ref_column in existing_header:
+                insert_at = existing_header[insert_ref_column] + (1 if insert_position == "after" else 0)
+                headers = headers[:insert_at - 1] + new_names + headers[insert_at - 1:]
             else:
-                v = ""  # 이번에 채워지지 않는 기존 열, 또는 매칭 안 된 열
-            row_values.append(v)
-        rows.append(row_values)
-        if max_preview_rows and len(rows) >= max_preview_rows:
-            break
+                headers = headers + new_names
+
+        plan_by_name = {}
+        for i, p in enumerate(data_plan):
+            plan_by_name.setdefault(p.output_name, i)
+
+        rows = []
+        for locations in iter_matched_rows(
+            wb, rma_sheet_name, rma_header_row, data_plan, key_column_name, log, sheet_header_rows=sheet_header_rows
+        ):
+            row_values = []
+            for h in headers:
+                plan_idx = plan_by_name.get(h)
+                if plan_idx is None:
+                    row_values.append("")
+                    continue
+                sheet, r, c = locations[plan_idx]
+                row_values.append(wb[sheet].cell(row=r, column=c).value if c is not None else "")
+            rows.append(row_values)
+            if max_preview_rows and len(rows) >= max_preview_rows:
+                break
+
+        filled_names = [p.output_name for p in data_plan]
+
+    else:
+        data_plan = plan
+        headers = [p.output_name for p in data_plan]
+        rows = []
+        for locations in iter_matched_rows(
+            wb, rma_sheet_name, rma_header_row, data_plan, key_column_name, log, sheet_header_rows=sheet_header_rows
+        ):
+            row_values = [
+                (wb[sheet].cell(row=r, column=c).value if c is not None else "")
+                for sheet, r, c in locations
+            ]
+            rows.append(row_values)
+            if max_preview_rows and len(rows) >= max_preview_rows:
+                break
+        filled_names = [p.output_name for p in data_plan]
 
     wb.close()
-    filled_names = [name for name, _ in columns]  # 이번에 실제로 값이 채워지는 열 이름들
     return headers, rows, missing_cols, filled_names
 
 
@@ -266,6 +478,10 @@ def run_conversion(
     copy_style,
     copy_formula,
     log,
+    key_column_name="",
+    insert_ref_column="",
+    insert_position="after",
+    sheet_header_rows=None,
 ):
     log(f"파일 여는 중: {filepath}")
     # 수식 문자열이 필요하므로 data_only=False (기본값) 로 연다.
@@ -276,18 +492,14 @@ def run_conversion(
             f"'{rma_sheet_name}' 시트를 찾을 수 없습니다. "
             f"현재 시트 목록: {wb.sheetnames}"
         )
-    ws_rma = wb[rma_sheet_name]
 
-    header_map = build_header_map(ws_rma, rma_header_row)
-    log(f"RMA 시트({rma_header_row}행)에서 찾은 열 이름 {len(header_map)}개: {list(header_map.keys())}")
-
-    columns, missing_cols = resolve_columns(column_spec_text, header_map)
-
-    if not columns:
+    plan, missing_cols = resolve_column_plan(
+        wb, rma_sheet_name, rma_header_row, column_spec_text, log, sheet_header_rows=sheet_header_rows
+    )
+    if not plan:
         raise ValueError("가져올 열을 하나도 찾지 못했습니다. 입력값과 헤더 행 번호를 확인해주세요.")
-
     if missing_cols:
-        log("※ 다음 열은 RMA 시트에서 찾지 못해 제외됩니다: " + ", ".join(missing_cols))
+        log("※ 다음 열은 찾지 못해 제외됩니다: " + ", ".join(missing_cols))
 
     # ---- 대상 시트 결정 ----
     if target_mode == "new":
@@ -296,10 +508,10 @@ def run_conversion(
         ws_target = wb.create_sheet(title=sheet_name)
         log(f"새 시트 생성: {sheet_name}")
 
-        # 헤더 쓰기
-        for i, (out_name, _) in enumerate(columns, start=1):
-            ws_target.cell(row=1, column=i, value=out_name)
-        target_col_positions = {out_name: i for i, (out_name, _) in enumerate(columns, start=1)}
+        data_plan = plan
+        for i, p in enumerate(data_plan, start=1):
+            ws_target.cell(row=1, column=i, value=p.output_name)
+        target_col_positions = list(range(1, len(data_plan) + 1))
         start_row = 2
 
     else:  # existing
@@ -309,65 +521,78 @@ def run_conversion(
         sheet_name = existing_sheet_name
         log(f"기존 시트 사용: {sheet_name}")
 
-        # 기존 시트의 1행을 헤더로 간주하고 이름 -> 열번호 매핑
-        existing_header = {}
-        for col_idx in range(1, ws_target.max_column + 1):
-            name = normalize(ws_target.cell(row=1, column=col_idx).value)
-            if name:
-                existing_header[name] = col_idx
+        skipped = [p for p in plan if p.col_idx is None]
+        if skipped:
+            log(f"※ 빈 스페이서 열은 '기존 시트에 이어서 추가' 모드에서 지원하지 않아 제외됩니다 ({len(skipped)}개).")
+        data_plan = [p for p in plan if p.col_idx is not None]
+
+        existing_header = build_header_map(ws_target, header_row=1)
 
         if not existing_header:
             # 기존 시트에 헤더가 아예 없으면 새로 씀
-            for i, (out_name, _) in enumerate(columns, start=1):
-                ws_target.cell(row=1, column=i, value=out_name)
-            target_col_positions = {out_name: i for i, (out_name, _) in enumerate(columns, start=1)}
+            for i, p in enumerate(data_plan, start=1):
+                ws_target.cell(row=1, column=i, value=p.output_name)
+            existing_header = {p.output_name: i for i, p in enumerate(data_plan, start=1)}
         else:
-            target_col_positions = {}
-            for out_name, _ in columns:
-                if out_name in existing_header:
-                    target_col_positions[out_name] = existing_header[out_name]
+            new_names = []
+            for p in data_plan:
+                if p.output_name not in existing_header and p.output_name not in new_names:
+                    new_names.append(p.output_name)
+
+            if new_names:
+                if insert_ref_column and insert_ref_column in existing_header:
+                    # 이번에 새로 추가되는 열 전체를 기준 열 옆 한 지점에 묶어서 삽입
+                    insert_at = existing_header[insert_ref_column] + (1 if insert_position == "after" else 0)
+                    ws_target.insert_cols(insert_at, amount=len(new_names))
+                    existing_header = {
+                        name: (idx + len(new_names) if idx >= insert_at else idx)
+                        for name, idx in existing_header.items()
+                    }
+                    for offset, name in enumerate(new_names):
+                        col = insert_at + offset
+                        ws_target.cell(row=1, column=col, value=name)
+                        existing_header[name] = col
+                    where = "뒤" if insert_position == "after" else "앞"
+                    log(f"  '{insert_ref_column}' {where}에 새 열 {len(new_names)}개를 삽입했습니다: {', '.join(new_names)}")
                 else:
-                    # 기존 시트에 없는 열이면 맨 뒤에 새로 추가
-                    new_idx = ws_target.max_column + 1
-                    ws_target.cell(row=1, column=new_idx, value=out_name)
-                    target_col_positions[out_name] = new_idx
-                    log(f"  '{out_name}' 열이 기존 시트에 없어 새로 추가했습니다.")
+                    # 지정 안 하면 기존처럼 맨 뒤에 추가
+                    for name in new_names:
+                        new_idx = ws_target.max_column + 1
+                        ws_target.cell(row=1, column=new_idx, value=name)
+                        existing_header[name] = new_idx
+                        log(f"  '{name}' 열이 기존 시트에 없어 새로 추가했습니다.")
+
+        target_col_positions = [existing_header[p.output_name] for p in data_plan]
 
         # 마지막 데이터 다음 행부터 이어서 추가.
         # ※ 시트 전체가 아니라, '이번에 실제로 채워 넣는 열들'만 봐서 마지막 행을 찾는다.
-        #    (예: 이전엔 SITE 열만 채웠고 이번엔 No./계약년/SYSTEM 열을 추가하는 경우,
-        #     SITE 열에 데이터가 있어도 무시하고 No./계약년/SYSTEM 열 기준으로 빈 자리부터 채움)
-        target_cols_this_run = list(target_col_positions.values())
         last_row = 1
         for r in range(ws_target.max_row, 1, -1):
-            if any(ws_target.cell(row=r, column=c).value not in (None, "") for c in target_cols_this_run):
+            if any(ws_target.cell(row=r, column=c).value not in (None, "") for c in target_col_positions):
                 last_row = r
                 break
         start_row = last_row + 1
 
     # ---- 데이터 복사 ----
-    data_start = rma_header_row + 1
-    data_end = ws_rma.max_row
-
     out_row = start_row
     copied_rows = 0
-    for r in range(data_start, data_end + 1):
-        # 빈 행은 건너뜀 (해당 행의 첫번째로 지정된 열이 비어있으면 스킵)
-        first_col_idx = columns[0][1]
-        if ws_rma.cell(row=r, column=first_col_idx).value in (None, ""):
-            continue
-        for out_name, rma_col_idx in columns:
-            src_cell = ws_rma.cell(row=r, column=rma_col_idx)
-            dst_col = target_col_positions[out_name]
-            dst_cell = ws_target.cell(row=out_row, column=dst_col)
-            copy_cell(src_cell, dst_cell, copy_style, copy_formula)
+    for locations in iter_matched_rows(
+        wb, rma_sheet_name, rma_header_row, data_plan, key_column_name, log, sheet_header_rows=sheet_header_rows
+    ):
+        for plan_idx, (sheet, r, c) in enumerate(locations):
+            dst_cell = ws_target.cell(row=out_row, column=target_col_positions[plan_idx])
+            if c is None:
+                dst_cell.value = None
+            else:
+                copy_cell(wb[sheet].cell(row=r, column=c), dst_cell, copy_style, copy_formula)
         out_row += 1
         copied_rows += 1
 
     log(f"복사된 데이터 행: {copied_rows}개")
     log("=== 가져온 열 ===")
-    for out_name, rma_col_idx in columns:
-        log(f"  {out_name}  <-  RMA {get_column_letter(rma_col_idx)}열")
+    for p in data_plan:
+        src_desc = f"{p.sheet_name}!{get_column_letter(p.col_idx)}" if p.col_idx is not None else "(빈 열)"
+        log(f"  {p.output_name}  <-  {src_desc}")
 
     wb.save(filepath)
     log("")
